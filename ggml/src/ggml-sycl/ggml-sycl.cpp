@@ -345,6 +345,12 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_SUPPORT_VMM: no\n");
 #endif
 
+#if defined(GGML_SYCL_ESIMD)
+        GGML_LOG_INFO("  GGML_SYCL_ESIMD: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ESIMD: no\n");
+#endif
+
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
 
