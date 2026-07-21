@@ -201,9 +201,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
+                // Route single-token decode to the register-resident vec kernel
+                // even when the GQA optimization applies. The vec kernel handles
+                // GQA internally (gqa_ratio) and avoids the tile kernel's
+                // barrier-heavy SLM staging, which dominates runtime for this
+                // short-batch shape.
+                return BEST_FATTN_KERNEL_VEC;
             }
         } else {
             if (Q->ne[1] <= 2) {
