@@ -40,6 +40,39 @@ constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
 
 template <ggml_type T> struct esimd_reorder_q_traits;
 
+// build a 32-lane vector whose low 16 lanes are `lo` and high 16 are `hi`
+// (a super-chunk splits into two 16-wide halves with distinct scale/min codes).
+static ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32> splat_lo_hi(float lo, float hi) {
+    using namespace sycl::ext::intel::esimd;
+    simd<float, 32> v;
+    v.select<16, 1>(0)  = lo;
+    v.select<16, 1>(16) = hi;
+    return v;
+}
+
+// unpack one block of Q4_K/Q5_K scale/min codes (get_scale_min_k4 layout) into 8
+// float scales (dall * sc) and 8 float mins (-dmin * m); the min carries the
+// negation so the dequant epilogue adds.
+static ESIMD_INLINE void unpack_scale_min_k4(
+        sycl::ext::intel::esimd::simd<uint8_t, 12> scales, float dall, float dmin,
+        sycl::ext::intel::esimd::simd<float, 8> & scale_f,
+        sycl::ext::intel::esimd::simd<float, 8> & min_f) {
+    using namespace sycl::ext::intel::esimd;
+    simd<uint8_t, 8> sc = 0;
+    simd<uint8_t, 8> m  = 0;
+    simd<uint8_t, 4> scale_lo = scales.select<4, 1>(0);
+    simd<uint8_t, 4> min_lo   = scales.select<4, 1>(4);
+    simd<uint8_t, 4> hi_bits  = scales.select<4, 1>(8);
+    sc.select<4, 1>(0) = scale_lo & simd<uint8_t, 4>(0x3F);
+    sc.select<4, 1>(4) = (hi_bits & simd<uint8_t, 4>(0x0F)) |
+                         ((scale_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+    m.select<4, 1>(0)  = min_lo & simd<uint8_t, 4>(0x3F);
+    m.select<4, 1>(4)  = (hi_bits >> simd<uint8_t, 4>(4)) |
+                         ((min_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
+    scale_f = convert<float>(sc) * dall;
+    min_f   = convert<float>(m) * (-dmin);
+}
+
 // ---------------------------------------------------------------------------
 // Q2_K, SOA reorder layout produced by reorder_qw_q2_k:
 //   [qs: nb*(QK_K/4)] [scales: nb*(QK_K/16)] [dm: nb*sizeof(half2)]
@@ -88,14 +121,13 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
 
-        // per-chunk scale (d * (sc & 0xF)) and min (dmin * (sc >> 4)), all 16 codes
+        // per-chunk scale (d * (sc & 0xF)) and min (-dmin * (sc >> 4)), all 16 codes;
+        // min carries the negation so the dequant epilogue adds (matches Q4_K/Q5_K)
         simd<float, 16> scale_f_a = convert<float>(scales_a & simd<uint8_t, 16>(0x0F)) * dall_a;
-        simd<float, 16> min_f_a   = convert<float>(scales_a >> simd<uint8_t, 16>(4))  * dmin_a;
+        simd<float, 16> min_f_a   = convert<float>(scales_a >> simd<uint8_t, 16>(4))  * (-dmin_a);
         simd<float, 16> scale_f_b = convert<float>(scales_b & simd<uint8_t, 16>(0x0F)) * dall_b;
-        simd<float, 16> min_f_b   = convert<float>(scales_b >> simd<uint8_t, 16>(4))  * dmin_b;
+        simd<float, 16> min_f_b   = convert<float>(scales_b >> simd<uint8_t, 16>(4))  * (-dmin_b);
 
-        // single fused dequant+MAC loop updating both accumulators each iteration
-        // the two acc chains are co-scheduled so FMA latency is overlapped
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             const int     byte_base = 32 * (s / 4);
@@ -105,7 +137,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             simd<uint8_t, 32> qa = (qs_a.select<32, 1>(byte_base) >> shift) & simd<uint8_t, 32>(3);
             simd<uint8_t, 32> qb = (qs_b.select<32, 1>(byte_base) >> shift) & simd<uint8_t, 32>(3);
 
-            // low 16 lanes use scale/min code 2s, high 16 use 2s+1
             const float scale_a_lo = scale_f_a[2 * s + 0];
             const float scale_a_hi = scale_f_a[2 * s + 1];
             const float min_a_lo   = min_f_a[2 * s + 0];
@@ -115,21 +146,13 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             const float min_b_lo   = min_f_b[2 * s + 0];
             const float min_b_hi   = min_f_b[2 * s + 1];
 
-            simd<float, 32> scale_vec_a;
-            simd<float, 32> min_vec_a;
-            simd<float, 32> scale_vec_b;
-            simd<float, 32> min_vec_b;
-            scale_vec_a.select<16, 1>(0)  = scale_a_lo;
-            scale_vec_a.select<16, 1>(16) = scale_a_hi;
-            min_vec_a.select<16, 1>(0)    = min_a_lo;
-            min_vec_a.select<16, 1>(16)   = min_a_hi;
-            scale_vec_b.select<16, 1>(0)  = scale_b_lo;
-            scale_vec_b.select<16, 1>(16) = scale_b_hi;
-            min_vec_b.select<16, 1>(0)    = min_b_lo;
-            min_vec_b.select<16, 1>(16)   = min_b_hi;
+            simd<float, 32> scale_vec_a = splat_lo_hi(scale_a_lo, scale_a_hi);
+            simd<float, 32> min_vec_a   = splat_lo_hi(min_a_lo, min_a_hi);
+            simd<float, 32> scale_vec_b = splat_lo_hi(scale_b_lo, scale_b_hi);
+            simd<float, 32> min_vec_b   = splat_lo_hi(min_b_lo, min_b_hi);
 
-            simd<float, 32> deq_a = convert<float>(qa) * scale_vec_a - min_vec_a;
-            simd<float, 32> deq_b = convert<float>(qb) * scale_vec_b - min_vec_b;
+            simd<float, 32> deq_a = convert<float>(qa) * scale_vec_a + min_vec_a;
+            simd<float, 32> deq_b = convert<float>(qb) * scale_vec_b + min_vec_b;
 
             acc_a += y_s * deq_a;
             acc_b += y_s * deq_b;
@@ -227,8 +250,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
         simd<float, 16> scale_f_a = unpack_scales(scales_a, d_a);
         simd<float, 16> scale_f_b = unpack_scales(scales_b, d_b);
 
-        // single fused dequant+MAC loop updating both accumulators each iteration
-        // the two acc chains are co-scheduled so FMA latency is overlapped
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             const int     byte_base = 32 * (s / 4);
@@ -251,18 +272,13 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
             simd<float, 32> qf_a = convert<float>(q3_a) - 4.0f;
             simd<float, 32> qf_b = convert<float>(q3_b) - 4.0f;
 
-            // low 16 lanes use scale code 2s, high 16 use 2s+1
             const float scale_a_lo = scale_f_a[2 * s + 0];
             const float scale_a_hi = scale_f_a[2 * s + 1];
             const float scale_b_lo = scale_f_b[2 * s + 0];
             const float scale_b_hi = scale_f_b[2 * s + 1];
 
-            simd<float, 32> scale_vec_a;
-            simd<float, 32> scale_vec_b;
-            scale_vec_a.select<16, 1>(0)  = scale_a_lo;
-            scale_vec_a.select<16, 1>(16) = scale_a_hi;
-            scale_vec_b.select<16, 1>(0)  = scale_b_lo;
-            scale_vec_b.select<16, 1>(16) = scale_b_hi;
+            simd<float, 32> scale_vec_a = splat_lo_hi(scale_a_lo, scale_a_hi);
+            simd<float, 32> scale_vec_b = splat_lo_hi(scale_b_lo, scale_b_hi);
 
             simd<float, 32> deq_a = qf_a * scale_vec_a;
             simd<float, 32> deq_b = qf_b * scale_vec_b;
@@ -292,8 +308,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
         return { qs, scales, dm };
     }
 
-    // dequantize block bia of pa and block bib of pb, MAC both against y_vec into acc_a / acc_b
-    // when has_b is false, block b is treated as all-zero and contributes nothing
     static ESIMD_INLINE void mac_pair(
             const ptrs & pa, size_t bia,
             const ptrs & pb, size_t bib, bool has_b,
@@ -318,44 +332,15 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
 
-        // unpack Q4_K scale/min codes (get_scale_min_k4 layout), vectorized, per block
-        simd<uint8_t, 8> sc = 0;
-        simd<uint8_t, 8> m  = 0;
         simd<float, 8> scale_f_a, min_f_a, scale_f_b, min_f_b;
-        {
-            simd<uint8_t, 4> scale_lo = scales_a.select<4, 1>(0);
-            simd<uint8_t, 4> min_lo   = scales_a.select<4, 1>(4);
-            simd<uint8_t, 4> hi_bits  = scales_a.select<4, 1>(8);
-            sc.select<4, 1>(0) = scale_lo & simd<uint8_t, 4>(0x3F);
-            sc.select<4, 1>(4) = (hi_bits & simd<uint8_t, 4>(0x0F)) |
-                                 ((scale_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            m.select<4, 1>(0)  = min_lo & simd<uint8_t, 4>(0x3F);
-            m.select<4, 1>(4)  = (hi_bits >> simd<uint8_t, 4>(4)) |
-                                 ((min_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            scale_f_a = convert<float>(sc) * dall_a;
-            min_f_a   = convert<float>(m) * (-dmin_a);
-        }
-        {
-            simd<uint8_t, 4> scale_lo = scales_b.select<4, 1>(0);
-            simd<uint8_t, 4> min_lo   = scales_b.select<4, 1>(4);
-            simd<uint8_t, 4> hi_bits  = scales_b.select<4, 1>(8);
-            sc.select<4, 1>(0) = scale_lo & simd<uint8_t, 4>(0x3F);
-            sc.select<4, 1>(4) = (hi_bits & simd<uint8_t, 4>(0x0F)) |
-                                 ((scale_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            m.select<4, 1>(0)  = min_lo & simd<uint8_t, 4>(0x3F);
-            m.select<4, 1>(4)  = (hi_bits >> simd<uint8_t, 4>(4)) |
-                                 ((min_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            scale_f_b = convert<float>(sc) * dall_b;
-            min_f_b   = convert<float>(m) * (-dmin_b);
-        }
+        unpack_scale_min_k4(scales_a, dall_a, dmin_a, scale_f_a, min_f_a);
+        unpack_scale_min_k4(scales_b, dall_b, dmin_b, scale_f_b, min_f_b);
 
-        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0f);
+        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0F);
         simd<uint8_t, 128> qs_hi_a = qs_a >> simd<uint8_t, 128>(4);
-        simd<uint8_t, 128> qs_lo_b = qs_b & simd<uint8_t, 128>(0x0f);
+        simd<uint8_t, 128> qs_lo_b = qs_b & simd<uint8_t, 128>(0x0F);
         simd<uint8_t, 128> qs_hi_b = qs_b >> simd<uint8_t, 128>(4);
 
-        // single fused dequant+MAC loop updating both accumulators each iteration
-        // the two acc chains are co-scheduled so FMA latency is overlapped
 #pragma unroll
         for (int sb = 0; sb < 8; sb += 2) {
             const int q_offset = sb * 16;
@@ -458,44 +443,15 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
 
-        // unpack Q5_K scale/min codes (get_scale_min_k4 layout, same as Q4_K), per block
-        simd<uint8_t, 8> sc = 0;
-        simd<uint8_t, 8> m  = 0;
         simd<float, 8> scale_f_a, min_f_a, scale_f_b, min_f_b;
-        {
-            simd<uint8_t, 4> scale_lo = scales_a.select<4, 1>(0);
-            simd<uint8_t, 4> min_lo   = scales_a.select<4, 1>(4);
-            simd<uint8_t, 4> hi_bits  = scales_a.select<4, 1>(8);
-            sc.select<4, 1>(0) = scale_lo & simd<uint8_t, 4>(0x3F);
-            sc.select<4, 1>(4) = (hi_bits & simd<uint8_t, 4>(0x0F)) |
-                                 ((scale_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            m.select<4, 1>(0)  = min_lo & simd<uint8_t, 4>(0x3F);
-            m.select<4, 1>(4)  = (hi_bits >> simd<uint8_t, 4>(4)) |
-                                 ((min_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            scale_f_a = convert<float>(sc) * dall_a;
-            min_f_a   = convert<float>(m) * (-dmin_a);
-        }
-        {
-            simd<uint8_t, 4> scale_lo = scales_b.select<4, 1>(0);
-            simd<uint8_t, 4> min_lo   = scales_b.select<4, 1>(4);
-            simd<uint8_t, 4> hi_bits  = scales_b.select<4, 1>(8);
-            sc.select<4, 1>(0) = scale_lo & simd<uint8_t, 4>(0x3F);
-            sc.select<4, 1>(4) = (hi_bits & simd<uint8_t, 4>(0x0F)) |
-                                 ((scale_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            m.select<4, 1>(0)  = min_lo & simd<uint8_t, 4>(0x3F);
-            m.select<4, 1>(4)  = (hi_bits >> simd<uint8_t, 4>(4)) |
-                                 ((min_lo >> simd<uint8_t, 4>(6)) << simd<uint8_t, 4>(4));
-            scale_f_b = convert<float>(sc) * dall_b;
-            min_f_b   = convert<float>(m) * (-dmin_b);
-        }
+        unpack_scale_min_k4(scales_a, dall_a, dmin_a, scale_f_a, min_f_a);
+        unpack_scale_min_k4(scales_b, dall_b, dmin_b, scale_f_b, min_f_b);
 
-        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0f);
+        simd<uint8_t, 128> qs_lo_a = qs_a & simd<uint8_t, 128>(0x0F);
         simd<uint8_t, 128> qs_hi_a = qs_a >> simd<uint8_t, 128>(4);
-        simd<uint8_t, 128> qs_lo_b = qs_b & simd<uint8_t, 128>(0x0f);
+        simd<uint8_t, 128> qs_lo_b = qs_b & simd<uint8_t, 128>(0x0F);
         simd<uint8_t, 128> qs_hi_b = qs_b >> simd<uint8_t, 128>(4);
 
-        // single fused dequant+MAC loop updating both accumulators each iteration
-        // the two acc chains are co-scheduled so FMA latency is overlapped
 #pragma unroll
         for (int sb = 0; sb < 8; sb += 2) {
             const int q_offset = sb * 16;
@@ -511,14 +467,14 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             const float min_b_lo   = min_f_b[sb];
             const float min_b_hi   = min_f_b[sb + 1];
 
-            simd<uint8_t, 32> qa_lo_b = qs_lo_a.select<32, 1>(q_offset);
-            simd<uint8_t, 32> qa_hi_b = qs_hi_a.select<32, 1>(q_offset);
-            simd<uint8_t, 32> qb_lo_b = qs_lo_b.select<32, 1>(q_offset);
-            simd<uint8_t, 32> qb_hi_b = qs_hi_b.select<32, 1>(q_offset);
-            simd<uint16_t, 32> qa_lo = convert<uint16_t>(qa_lo_b);
-            simd<uint16_t, 32> qa_hi = convert<uint16_t>(qa_hi_b);
-            simd<uint16_t, 32> qb_lo = convert<uint16_t>(qb_lo_b);
-            simd<uint16_t, 32> qb_hi = convert<uint16_t>(qb_hi_b);
+            simd<uint8_t, 32> qa_lo_u8 = qs_lo_a.select<32, 1>(q_offset);
+            simd<uint8_t, 32> qa_hi_u8 = qs_hi_a.select<32, 1>(q_offset);
+            simd<uint8_t, 32> qb_lo_u8 = qs_lo_b.select<32, 1>(q_offset);
+            simd<uint8_t, 32> qb_hi_u8 = qs_hi_b.select<32, 1>(q_offset);
+            simd<uint16_t, 32> qa_lo = convert<uint16_t>(qa_lo_u8);
+            simd<uint16_t, 32> qa_hi = convert<uint16_t>(qa_hi_u8);
+            simd<uint16_t, 32> qb_lo = convert<uint16_t>(qb_lo_u8);
+            simd<uint16_t, 32> qb_hi = convert<uint16_t>(qb_hi_u8);
 
             // add the 5th bit: chunk sb uses qh bit sb, chunk sb+1 uses qh bit sb+1;
             // qh always indexes the same 32 bytes regardless of chunk
@@ -553,10 +509,10 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
     };
 
     static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
-        const uint8_t * ql    = (const uint8_t *) vx;
-        const uint8_t * qh    = ql + nb * (QK_K / 2);
-        const int8_t *  scales = (const int8_t *) (qh + nb * (QK_K / 4));
-        const sycl::half * d  = (const sycl::half *) (scales + nb * (QK_K / 16));
+        const uint8_t *    ql     = (const uint8_t *) vx;
+        const uint8_t *    qh     = ql + nb * (QK_K / 2);
+        const int8_t *     scales = (const int8_t *) (qh + nb * (QK_K / 4));
+        const sycl::half * d      = (const sycl::half *) (scales + nb * (QK_K / 16));
         return { ql, qh, scales, d };
     }
 
@@ -568,22 +524,24 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> ql_a    = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
-        simd<uint8_t, 128> ql_b    = 0;
-        simd<uint8_t, 64>  qh_a    = block_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
-        simd<uint8_t, 64>  qh_b    = 0;
-        simd<int8_t, 16>   scale_a = block_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
-        simd<int8_t, 16>   scale_b = 0;
+        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
+        simd<uint8_t, 128> ql_b     = 0;
+        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
+        simd<uint8_t, 64>  qh_b     = 0;
+        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
+        simd<int8_t, 16>   scales_b = 0;
+
+        const float d_a = (float) pa.d[bia];
+        float d_b = 0.0f;
         if (has_b) {
-            ql_b    = block_load<uint8_t, 128>(pb.ql + bib * (QK_K / 2));
-            qh_b    = block_load<uint8_t, 64>(pb.qh + bib * (QK_K / 4));
-            scale_b = block_load<int8_t, 16>(pb.scales + bib * (QK_K / 16));
+            ql_b     = block_load<uint8_t, 128>(pb.ql + bib * (QK_K / 2));
+            qh_b     = block_load<uint8_t, 64>(pb.qh + bib * (QK_K / 4));
+            scales_b = block_load<int8_t, 16>(pb.scales + bib * (QK_K / 16));
+            d_b = (float) pb.d[bib];
         }
 
-        simd<float, 16> sc_a = convert<float>(scale_a);
-        simd<float, 16> sc_b = convert<float>(scale_b);
-        const float d_a = (float) pa.d[bia];
-        const float d_b = has_b ? (float) pb.d[bib] : 0.0f;
+        simd<float, 16> sc_a = convert<float>(scales_a);
+        simd<float, 16> sc_b = convert<float>(scales_b);
 
 #pragma unroll
         for (int im = 0; im < 2; ++im) {
@@ -594,7 +552,6 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             simd<uint8_t, 32> ql_hi_b   = ql_b.select<32, 1>(64 * im + 32);
             simd<uint8_t, 32> qh_bits_b = qh_b.select<32, 1>(32 * im);
 
-            // four quant groups, both blocks interleaved per group
             // reconstruct each 32-wide 6-bit group (matches dequantize_row_q6_K)
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
@@ -605,12 +562,8 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
                 const float scale_b_lo = sc_b[8 * im + 2 * g + 0] * d_b;
                 const float scale_b_hi = sc_b[8 * im + 2 * g + 1] * d_b;
 
-                simd<float, 32> scale_vec_a;
-                scale_vec_a.select<16, 1>(0)  = scale_a_lo;
-                scale_vec_a.select<16, 1>(16) = scale_a_hi;
-                simd<float, 32> scale_vec_b;
-                scale_vec_b.select<16, 1>(0)  = scale_b_lo;
-                scale_vec_b.select<16, 1>(16) = scale_b_hi;
+                simd<float, 32> scale_vec_a = splat_lo_hi(scale_a_lo, scale_a_hi);
+                simd<float, 32> scale_vec_b = splat_lo_hi(scale_b_lo, scale_b_hi);
 
                 simd<uint8_t, 32> qa;
                 simd<uint8_t, 32> qb;
