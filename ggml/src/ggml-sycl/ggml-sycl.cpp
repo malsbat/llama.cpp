@@ -4462,7 +4462,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // for best performance use ESIMD when supported, followed by MMVQ, and finally DMMV
 
     if (!g_ggml_sycl_prioritize_dmmv && should_reorder_tensor(ctx, dst)) {
-        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);
+        // ESIMD support alone must not force the DMMV reorder for a type unless MMVQ can
+        // also consume that reordered layout: a later multi-token call on the same tensor
+        // (ne[1] in 2..8) takes the MMVQ path, and without a reorder-aware MMVQ kernel it
+        // would read the DMMV-reordered bytes as if they were still the plain AoS layout.
+        bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type) &&
+                   ggml_sycl_supports_reorder_mmvq(src0->type);
         if (ggml_sycl_supports_reorder_mmvq(src0->type)) {
             // Arc770 get benefit with Q4_0 by skipping MMVQ path
             if (!(ggml_sycl_info().devices[ctx.device].hw_info.arch ==
