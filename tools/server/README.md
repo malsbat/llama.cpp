@@ -196,7 +196,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--ui-config, --webui-config JSON` | JSON that provides default UI settings (overrides UI defaults)<br/>(env: LLAMA_ARG_UI_CONFIG) |
 | `--ui-config-file, --webui-config-file PATH` | JSON file that provides default UI settings (overrides UI defaults)<br/>(env: LLAMA_ARG_UI_CONFIG_FILE) |
 | `--ui-mcp-proxy, --webui-mcp-proxy, --no-ui-mcp-proxy, --no-webui-mcp-proxy` | experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)<br/>(env: LLAMA_ARG_UI_MCP_PROXY) |
-| `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_datetime, get_info<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_TOOLS) |
+| `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_TOOLS) |
 | `--tools-runtime OPTION` | experimental: run tools in a separate runtime environment (default: none, use host environment)<br/>available options:<br/>  'docker:<image>', 'podman:<image>': spin up a new container and reuse it for all invocations, clean up on server exit<br/>  'docker-container:<id>', 'podman-container:<id>': use an existing container by ID, won't stop on server exit<br/>  'ssh:<target>': run tools on a remote POSIX host over SSH, key-based auth and a trusted host key are required<br/><br/>(env: LLAMA_ARG_TOOLS_RUNTIME) |
 | `--mcp-servers-config PATH` | experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_CONFIG) |
 | `--mcp-servers-json JSON` | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_JSON) |
@@ -296,10 +296,17 @@ For the full list of features, please refer to [server's changelog](https://gith
 
 Note: If both command line argument and environment variable are both set for the same param, the argument will take precedence over env var.
 
-For boolean options like `--mmap` or `--kv-offload`, the environment variable is handled as shown in this example:
-- `LLAMA_ARG_MMAP=true` means enabled, other accepted values are: `1`, `on`, `enabled`
-- `LLAMA_ARG_MMAP=false` means disabled, other accepted values are: `0`, `off`, `disabled`
-- If `LLAMA_ARG_NO_MMAP` is present (no matter the value), it means disabling mmap
+For string options like `--load-mode`, the environment variable is handled as shown in this example:
+- `LLAMA_ARG_LOAD_MODE=auto` sets the loading mode to auto (default)
+- `LLAMA_ARG_LOAD_MODE=none` disables special loading
+- `LLAMA_ARG_LOAD_MODE=mmap` enables memory-mapping
+- `LLAMA_ARG_LOAD_MODE=mlock` locks the model in RAM
+- `LLAMA_ARG_LOAD_MODE=mmap+mlock` enables memory-mapping and locks in RAM
+- `LLAMA_ARG_LOAD_MODE=dio` uses DirectIO if available
+
+For boolean options like `--kv-offload`:
+- `LLAMA_ARG_KV_OFFLOAD=true` means enabled, other accepted values are: `1`, `on`, `enabled`
+- `LLAMA_ARG_KV_OFFLOAD=false` means disabled, other accepted values are: `0`, `off`, `disabled`
 
 Example usage of docker compose with environment variables:
 
@@ -1893,7 +1900,7 @@ Example events:
 }
 // note for "loading" status:
 // - subsequent events will follow the same order of "stages" list
-// - mmap is may report incorrect progress on some platforms; if you need exact progress, use --no-mmap
+// - mmap may report incorrect progress on some platforms; if you need exact progress, use --load-mode none
 
 {
   "model": "...",
