@@ -3,8 +3,6 @@
 
 #include <algorithm>
 
-// mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
-// (weight layout, split buffers, DMMV) is checked by ggml_sycl_op_mul_mat_glu_mmvq_fused().
 static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const ggml_tensor * up,
                                               const ggml_tensor * glu) {
     // the fused epilogue implements these two; the rest fall back to the standalone GLU kernels
@@ -52,6 +50,17 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
     // mat-vec only: one column per decoded token, up to the batch the reorder kernels cover
     if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    // with DMMV prioritised the unfused path would not have gone through mmvq at all
+    if (g_ggml_sycl_prioritize_dmmv) {
+        return false;
+    }
+
+    const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    if (!extra_u || !extra_g || !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
         return false;
     }
 

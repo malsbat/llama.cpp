@@ -4858,34 +4858,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 }
 
-// Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph at node_idx.
-// Returns false if it declined, in which case the caller runs the three nodes normally.
-static bool ggml_sycl_op_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu) {
+// Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph
+static void ggml_sycl_op_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu) {
     const ggml_tensor * wu   = up->src[0];
     const ggml_tensor * wg   = gate->src[0];
     const ggml_tensor * act  = up->src[1];
 
-    // this writes glu->data directly rather than the per-device row slices that
-    // ggml_sycl_op_mul_mat() stitches back together, so it cannot serve split weights
-    if (ggml_backend_buffer_is_sycl_split(wu->buffer) || ggml_backend_buffer_is_sycl_split(wg->buffer)) {
-        return false;
-    }
-
-    // with DMMV prioritised the unfused path would not have gone through mmvq at all
-    if (g_ggml_sycl_prioritize_dmmv) {
-        return false;
-    }
-
-    // install the reorder (SoA) layout the fused kernel needs, as the unfused mmvq path would;
-    // a no-op once done. after the bail checks so a declined op does not pay for it.
-    opt_for_reorder(&ctx, wu, act, up, mul_mat_algo::MMVQ);
-    opt_for_reorder(&ctx, wg, act, gate, mul_mat_algo::MMVQ);
-
+    GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(wu->buffer) && !ggml_backend_buffer_is_sycl_split(wg->buffer));
+    GGML_ASSERT(!g_ggml_sycl_prioritize_dmmv);
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
     const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
-    if (!extra_u || !extra_g || !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
-        return false;
-    }
+    GGML_ASSERT(extra_u && extra_g && extra_u->optimized_feature.reorder && extra_g->optimized_feature.reorder);
 
     // log the up mat-mul: glu's own srcs are the two intermediates the fusion never materialises
     scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/2, " : fused with gate + GLU");
@@ -4905,11 +4888,10 @@ static bool ggml_sycl_op_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
     quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
                                                           src1_padded_cols, stream);
 
-    return ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
-                                               (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11,
-                                               /*stride_col_y_bytes=*/src1_padded_cols * (int) sizeof(block_q8_1) /
-                                                   QK8_1,
-                                               /*stride_col_dst=*/(int) glu->ne[0], stream);
+    ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
+                                        (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11,
+                                        /*stride_col_y_bytes=*/src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1,
+                                        /*stride_col_dst=*/(int) glu->ne[0], stream);
 }
 
 // Batch the run of consecutive L2_NORM siblings starting at node_idx into one launch.
