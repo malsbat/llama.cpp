@@ -45,9 +45,6 @@
 #    include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
 #    define GGML_SYCL_SUPPORT_VMM
 #endif
-#if defined(__INTEL_LLVM_COMPILER)
-    #define GGML_SYCL_DMMV_HAS_ESIMD
-#endif
 #include <sycl/half_type.hpp>
 
 #include "ggml.h"
@@ -4859,13 +4856,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 }
 
 // Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph
-static void ggml_sycl_op_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu) {
-    const ggml_tensor * wu   = up->src[0];
-    const ggml_tensor * wg   = gate->src[0];
-    const ggml_tensor * act  = up->src[1];
+static void ggml_sycl_op_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * glu) {
+    const ggml_tensor * wu  = up->src[0];
+    const ggml_tensor * wg  = gate->src[0];
+    const ggml_tensor * act = up->src[1];
 
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(wu->buffer) && !ggml_backend_buffer_is_sycl_split(wg->buffer));
-    GGML_ASSERT(!g_ggml_sycl_prioritize_dmmv);
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
     const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
     GGML_ASSERT(extra_u && extra_g && extra_u->optimized_feature.reorder && extra_g->optimized_feature.reorder);
@@ -4873,23 +4869,40 @@ static void ggml_sycl_op_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
     // log the up mat-mul: glu's own srcs are the two intermediates the fusion never materialises
     scope_op_debug_print scope_dbg_print(__func__, up, /*num_src=*/2, " : fused with gate + GLU");
 
-    const int64_t ne00 = wu->ne[0];
-    const int64_t ne11 = act->ne[1];
+    const int ncols     = (int) wu->ne[0];
+    const int nrows     = (int) wu->ne[1];
+    const int ncols_dst = (int) act->ne[1];
 
-    const queue_ptr stream           = ctx.stream();
-    const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+    const queue_ptr stream = ctx.stream();
+
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (g_ggml_sycl_enable_esimd) {
+        // Dequantize-based (DMMV) fused path: reads the reordered Q4_K weights with
+        // wide block loads and consumes the raw F32 activation directly, so no Q8_1
+        // quantization buffer is needed.
+        // TODO MMVQ is faster when ncols_dst > 1, improve selection logic
+        for (int dst_col = 0; dst_col < ncols_dst; ++dst_col) {
+            const float * x_col_ptr = (const float *) ((const char *) act->data + dst_col * act->nb[1]);
+            float * dst_col_ptr     = (float *) ((char *) glu->data + dst_col * glu->nb[1]);
+            ggml_sycl_op_fused_glu_q4k_esimd(wg->data, wu->data, x_col_ptr, dst_col_ptr, ncols, nrows,
+                                             ggml_get_glu_op(glu), stream);
+        }
+        return;
+    }
+#endif
 
     // one activation, quantized once and fully consumed into src1_ddq before the GEMV on this
     // in-order queue, so glu->data aliasing the dead activation needs no memory-range check
+    const int src1_padded_cols = GGML_PAD(ncols, MATRIX_ROW_PADDING);
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-                                             (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
-    char *                     src1_ddq = src1_q8_alloc.get();
+                                             (size_t) ncols_dst * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_ddq = src1_q8_alloc.get();
 
-    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, ncols, ncols_dst,
                                                           src1_padded_cols, stream);
 
     ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
-                                        (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11,
+                                        (float *) glu->data, ncols, nrows, ncols_dst,
                                         /*stride_col_y_bytes=*/src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1,
                                         /*stride_col_dst=*/(int) glu->ne[0], stream);
 }
@@ -6060,7 +6073,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL_MAT &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
             ggml_tensor * glu = cgraph->nodes[i + 2];
-            ggml_sycl_op_mul_mat_glu_mmvq_fused(*sycl_ctx, glu->src[0], glu->src[1], glu);
+            ggml_sycl_op_mul_mat_glu_fused(*sycl_ctx, glu->src[0], glu->src[1], glu);
             i += 2;
             continue;
         }

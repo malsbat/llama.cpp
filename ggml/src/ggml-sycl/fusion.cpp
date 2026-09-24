@@ -1,5 +1,6 @@
 #include "fusion.hpp"
 #include "binbcast.hpp"
+#include "dmmv.hpp"
 
 #include <algorithm>
 
@@ -50,11 +51,6 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
     // mat-vec only: one column per decoded token, up to the batch the reorder kernels cover
     if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
-        return false;
-    }
-
-    // with DMMV prioritised the unfused path would not have gone through mmvq at all
-    if (g_ggml_sycl_prioritize_dmmv) {
         return false;
     }
 
