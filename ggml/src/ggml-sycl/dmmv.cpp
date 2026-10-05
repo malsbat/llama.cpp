@@ -2135,6 +2135,107 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
     }
 }
 
+// ESIMD fused gate+up+GLU on reordered K-quant SOA weights: one output row (gate
+// and up) per work-group, two independent 32-wide accumulators per super-block.
+// Reuses the DMMV kernels' dequant+MAC primitive (esimd_reorder_q_traits<T>::mac_pair).
+template <ggml_type T>
+static void dequantize_mul_mat_vec_glu_reorder_esimd(const void * vx, const void * vgate,
+                                                     const float * y, float * dst,
+                                                     const int ncols, const int nrows,
+                                                     const ggml_glu_op glu_op,
+                                                     dpct::queue_ptr stream) {
+    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<T>;
+
+    GGML_ASSERT(ncols % QK_K == 0);
+
+    const int    num_blocks_per_row = ncols / QK_K;
+    const size_t nb = (size_t) nrows * num_blocks_per_row;
+
+    constexpr int WG_SIZE = GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+    const int     workgroups = nrows; // one output row (gate+up) per work-group
+
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG_SIZE * 2), h);
+
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG_SIZE), sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+
+                const int lid = it.get_local_id(0);
+                const int row = it.get_group(0);
+
+                const auto pg = traits::make_ptrs(vgate, nb);
+                const auto pu = traits::make_ptrs(vx, nb);
+
+                simd<float, 32> acc_g = 0.0f; // gate projection
+                simd<float, 32> acc_u = 0.0f; // up projection
+
+                for (int s = lid; s < num_blocks_per_row; s += WG_SIZE) {
+                    simd<float, 256> rhs_vec = block_load<float, 256>(y + (size_t) s * QK_K);
+
+                    const size_t bi = (size_t) row * num_blocks_per_row + s;
+
+                    // dequant+MAC one super-block of gate and up against the shared
+                    // activation slice (has_b=true: up always contributes)
+                    traits::mac_pair(pg, bi, pu, bi, /*has_b=*/true, rhs_vec, acc_g, acc_u);
+                }
+
+                lmem[lid * 2 + 0] = reduce<float>(acc_g, std::plus<>{});
+                lmem[lid * 2 + 1] = reduce<float>(acc_u, std::plus<>{});
+                it.barrier(sycl::access::fence_space::local_space);
+
+                if (lid == 0) {
+                    float gate = 0.0f;
+                    float up   = 0.0f;
+                    for (int t = 0; t < WG_SIZE; ++t) {
+                        gate += lmem[t * 2 + 0];
+                        up   += lmem[t * 2 + 1];
+                    }
+                    // SwiGLU: silu(gate)*up = gate*sigmoid(gate)*up. GEGLU's tanh form reduces
+                    // to the same shape via tanh(y) = 2*sigmoid(2y) - 1, so only the sigmoid
+                    // argument differs. sigmoid via exp2 (width-1 simd is a degenerate case for
+                    // the EM pipe, so broadcast to 16 lanes); lane 0 holds the result.
+                    const float GELU_COEF_A    = 0.044715f;
+                    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+                    const float NEG_LOG2E      = -1.44269504088896341f;
+
+                    const float arg = (glu_op == GGML_GLU_OP_GEGLU) ?
+                        2.0f * SQRT_2_OVER_PI * gate * (1.0f + GELU_COEF_A * gate * gate) :
+                        gate;
+
+                    simd<float, 16> g = arg * NEG_LOG2E;
+                    simd<float, 16> e = exp2(g);
+                    dst[row] = gate / (1.0f + e[0]) * up;
+                }
+            });
+    });
+}
+
+bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type, enum ggml_glu_op glu_op,
+                                                        const void * vx, const void * vgate, const float * y,
+                                                        float * dst, int ncols, int nrows, dpct::queue_ptr stream) {
+    switch (src0_type) {
+        case GGML_TYPE_Q2_K:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q2_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        case GGML_TYPE_Q3_K:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q3_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        case GGML_TYPE_Q4_K:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q4_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q5_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
