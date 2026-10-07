@@ -2006,42 +2006,9 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const
     });
 }
 
-// Q8_0 SOA reorder layout: [qs: nb*QK8_0] [d: nb*sizeof(half)].
+using ggml_sycl_esimd::q8_0_mac_stripe;
+
 // Process eight blocks per stripe and process remaining blocks one at a time.
-template <int NBLK>
-ESIMD_INLINE void q8_0_mac_stripe(
-        const int8_t * qs_a, const int8_t * qs_b,
-        const sycl::half * d_a, const sycl::half * d_b, bool has_b,
-        sycl::ext::intel::esimd::simd<float, 32 * NBLK> & y_vec,
-        sycl::ext::intel::esimd::simd<float, 32> & acc_a,
-        sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
-    using namespace sycl::ext::intel::esimd;
-
-    simd<int8_t, 32 * NBLK> qa = block_load<int8_t, 32 * NBLK>(qs_a);
-    simd<int8_t, 32 * NBLK> qb = 0;
-    // Scale rows can be only 2-byte aligned when nblk_row is odd.
-    simd<sycl::half, NBLK>  da = block_load<sycl::half, NBLK>(d_a, element_aligned_tag{});
-    simd<sycl::half, NBLK>  db = 0;
-    if (has_b) {
-        qb = block_load<int8_t, 32 * NBLK>(qs_b);
-        db = block_load<sycl::half, NBLK>(d_b, element_aligned_tag{});
-    }
-
-    simd<float, NBLK> da_f = convert<float>(da);
-    simd<float, NBLK> db_f = convert<float>(db);
-
-#pragma unroll
-    for (int s = 0; s < NBLK; ++s) {
-        simd<float, 32>  y_s  = y_vec.template select<32, 1>(s * 32);
-        simd<int8_t, 32> qa_s = qa.template select<32, 1>(s * 32);
-        simd<int8_t, 32> qb_s = qb.template select<32, 1>(s * 32);
-        const float sa = da_f[s];
-        const float sb = db_f[s];
-        acc_a += y_s * (convert<float>(qa_s) * sa);
-        acc_b += y_s * (convert<float>(qb_s) * sb);
-    }
-}
-
 template <int WG>
 ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
         const void * vx, const float * y, float * dst,
@@ -2135,7 +2102,7 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
     }
 }
 
-// ESIMD fused gate+up+GLU on reordered K-quant SOA weights: one output row (gate
+// ESIMD fused gate+up+GLU on reordered K-quant or Q8_0 SOA weights: one output row (gate
 // and up) per work-group, two independent 32-wide accumulators per super-block.
 // Reuses the DMMV kernels' dequant+MAC primitive (esimd_reorder_q_traits<T>::mac_pair).
 template <ggml_type T>
@@ -2230,6 +2197,9 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(enum ggml_type src0_type
             return true;
         case GGML_TYPE_Q6_K:
             dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q6_K>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
+            return true;
+        case GGML_TYPE_Q8_0:
+            dequantize_mul_mat_vec_glu_reorder_esimd<GGML_TYPE_Q8_0>(vx, vgate, y, dst, ncols, nrows, glu_op, stream);
             return true;
         default:
             return false;

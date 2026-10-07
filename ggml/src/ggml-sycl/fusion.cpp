@@ -37,10 +37,10 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     const bool reorder_pair = wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K;
     const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
                             (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
-    // the ESIMD kernel covers same-type q2_K..q6_K, single column only (as unfused DMMV)
+    // the ESIMD kernel covers same-type q2_K..q6_K and q8_0, single column only (as unfused DMMV)
     const bool esimd_pair   = g_ggml_sycl_enable_esimd && wu->type == wg->type && act->ne[1] == 1 &&
                             (wu->type == GGML_TYPE_Q2_K || wu->type == GGML_TYPE_Q3_K || wu->type == GGML_TYPE_Q4_K ||
-                             wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_Q6_K);
+                             wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_Q6_K || wu->type == GGML_TYPE_Q8_0);
     if ((!reorder_pair && !plain_pair && !esimd_pair) || wu->ne[0] % QK_K != 0) {
         return false;
     }

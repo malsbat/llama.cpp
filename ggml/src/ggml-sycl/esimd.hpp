@@ -10,10 +10,10 @@ namespace ggml_sycl_esimd {
 constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
 
 //
-// Shared ESIMD building blocks for the reordered K-quant dequantize-matvec
+// Shared ESIMD building blocks for the reordered K-quant and Q8_0 dequantize-matvec
 // kernels.
 //
-// The reordered K-quant ESIMD matvec kernels share one skeleton: per super-block,
+// The reordered K-quant (and Q8_0) ESIMD matvec kernels share one skeleton: per super-block,
 // load a 256-float activation slice, load one weight block, dequantize it into 8
 // chunks of 32 and MAC each chunk against the matching activation slice, then
 // reduce and run a lane-0 epilogue.
@@ -581,6 +581,71 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
                 acc_b += y_g * deq_b;
             }
         }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Q8_0, SOA reorder layout: [qs: nb*QK8_0] [d: nb*sizeof(half)].
+// q8_0_mac_stripe MACs NBLK consecutive blocks against a 32*NBLK activation slice.
+// ---------------------------------------------------------------------------
+template <int NBLK>
+ESIMD_INLINE void q8_0_mac_stripe(
+        const int8_t * qs_a, const int8_t * qs_b,
+        const sycl::half * d_a, const sycl::half * d_b, bool has_b,
+        sycl::ext::intel::esimd::simd<float, 32 * NBLK> & y_vec,
+        sycl::ext::intel::esimd::simd<float, 32> & acc_a,
+        sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+    using namespace sycl::ext::intel::esimd;
+
+    simd<int8_t, 32 * NBLK> qa = block_load<int8_t, 32 * NBLK>(qs_a);
+    simd<int8_t, 32 * NBLK> qb = 0;
+    // Scale rows can be only 2-byte aligned when nblk_row is odd.
+    simd<sycl::half, NBLK>  da = block_load<sycl::half, NBLK>(d_a, element_aligned_tag{});
+    simd<sycl::half, NBLK>  db = 0;
+    if (has_b) {
+        qb = block_load<int8_t, 32 * NBLK>(qs_b);
+        db = block_load<sycl::half, NBLK>(d_b, element_aligned_tag{});
+    }
+
+    simd<float, NBLK> da_f = convert<float>(da);
+    simd<float, NBLK> db_f = convert<float>(db);
+
+#pragma unroll
+    for (int s = 0; s < NBLK; ++s) {
+        simd<float, 32>  y_s  = y_vec.template select<32, 1>(s * 32);
+        simd<int8_t, 32> qa_s = qa.template select<32, 1>(s * 32);
+        simd<int8_t, 32> qb_s = qb.template select<32, 1>(s * 32);
+        const float sa = da_f[s];
+        const float sb = db_f[s];
+        acc_a += y_s * (convert<float>(qa_s) * sa);
+        acc_b += y_s * (convert<float>(qb_s) * sb);
+    }
+}
+
+// Treat QK_K/QK8_0 consecutive Q8_0 blocks as one super-block. Only valid when ncols % QK_K == 0;
+// here nb and bia count super-blocks.
+template <> struct esimd_reorder_q_traits<GGML_TYPE_Q8_0> {
+    static constexpr int NBLK = QK_K / QK8_0;
+
+    struct ptrs {
+        const int8_t *     qs;
+        const sycl::half * d;
+    };
+
+    static ESIMD_INLINE ptrs make_ptrs(const void * vx, size_t nb) {
+        const int8_t *     qs = (const int8_t *) vx;
+        const sycl::half * d  = (const sycl::half *) (qs + nb * QK_K);
+        return { qs, d };
+    }
+
+    static ESIMD_INLINE void mac_pair(
+            const ptrs & pa, size_t bia,
+            const ptrs & pb, size_t bib, bool has_b,
+            sycl::ext::intel::esimd::simd<float, 256> & y_vec,
+            sycl::ext::intel::esimd::simd<float, 32> & acc_a,
+            sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
+        q8_0_mac_stripe<NBLK>(pa.qs + bia * QK_K, pb.qs + bib * QK_K, pa.d + bia * NBLK, pb.d + bib * NBLK,
+                              has_b, y_vec, acc_a, acc_b);
     }
 };
 
